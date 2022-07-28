@@ -104,29 +104,10 @@ import java.lang.reflect.Method;
 import java.nio.channels.ClosedByInterruptException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.NavigableSet;
-import java.util.NoSuchElementException;
-import java.util.Objects;
-import java.util.Set;
-import java.util.SortedSet;
-import java.util.TimeZone;
-import java.util.TreeMap;
-import java.util.TreeSet;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.atomic.LongAdder;
@@ -244,29 +225,16 @@ public abstract class ModelMesh extends ThriftService
     public final long LOCAL_JANITOR_FREQ_SECS = Long.getLong("tas.janitor_freq_secs", 6 * 60); // 6mins
 
     // interval for rate checking task which tracks rate of reqs to each model
-    protected final long RATE_CHECK_INTERVAL_MS = Long.getLong("tas.ratecheck_freq_ms", 11_000L); // 11sec
+    protected final long RATE_CHECK_INTERVAL_MS = Long.getLong("tas.ratecheck_freq_ms", 10_000L); // 10sec
 
     protected static final int DEFAULT_SCALEUP_RPM = 2000;
 
-    /* If single-copy models are seen by the janitor to have been used
-     * within these times, it will ensure two copies are loaded (in
-     * different instances). A different "age" relative to the model's
-     * lastUsed cache timestamp is used depending on whether any "real"
-     * usage has been recorded yet for the model in this instance.
-     * The smaller time for the "unused" case is to avoid scaling up
-     * newly-added models which have a recent cache timestamp but have
-     * never actually been used.
-     * The times should be greater than the janitor frequency
-     */
-    public static final long SECOND_COPY_ADD_AGE_UNUSED_MS = 10 * 60_000L; // 10mins
-    public static final long SECOND_COPY_ADD_AGE_USED_MS = 12 * 3600_000L; // 12hours
-
     /* Last-used age after which second model copies will be removed
      * (2->1 scaledown). Note this is a maximum and a smaller value might
-     * be used if the global age of the cache is small (less than 5x this value).
+     * be used if the global age of the cache is small (less than 10x this value).
      * Also note that scale-downs are only done if the cache is (globally) full.
      */
-    public static final long SECOND_COPY_REMOVE_MAX_AGE_MS = 16 * 3600_000L; // 16hours
+    public static final long SECOND_COPY_REMOVE_MAX_AGE_MS = 10 * 3600_000L; // 10hours
 
     /* When models are added to the cluster via the registerModel method with the
      * load parameter set to true, the recency timestamp of the loaded
@@ -1552,10 +1520,6 @@ public abstract class ModelMesh extends ThriftService
 
     /* --------------------------------- local cache entry ------------------------------------------------------ */
 
-    @SuppressWarnings("rawtypes")
-    static final AtomicLongFieldUpdater<CacheEntry> LAST_2ND_COPY_TIME_UPDATER = AtomicLongFieldUpdater
-            .newUpdater(CacheEntry.class, "lastSecondCopyTriggerNanos");
-
     final CacheEntry<?> newInternalCacheEntry(String id, int weight) {
         CacheEntry<?> ce = new CacheEntry(id, weight);
         // timestamp is set to max long value so this will never be evicted
@@ -1580,6 +1544,15 @@ public abstract class ModelMesh extends ThriftService
         // Records time of first transition into any of SIZING/ACTIVE/FAILED states
         long loadCompleteTimestamp;
 
+        // This is used *only* by the rate tracking task and only when this is the only
+        // copy of the model. It tracks whether the model has been used in each of the
+        // last four time slices, where each slice comprises 32 rate tracking task
+        // iterations. The lower four bits correspond to these four time slices.
+        // Addition of a second copy is triggered when the model has been used in the
+        // both the most recent time slice and the least recent (approximately
+        // 10-20 minutes apart).
+        byte usageSlices;
+
         private CacheEntry(String modelId, int weight) { // not used for "real" entries
             this.modelId = modelId;
             this.modelInfo = null;
@@ -1594,7 +1567,7 @@ public abstract class ModelMesh extends ThriftService
                     .setEncKey(mr.getEncryptionKey()), failure);
         }
 
-        CacheEntry(CacheEntry<?> replaceFailed) { // for updating loadTimstamp of already-failed entries
+        CacheEntry(CacheEntry<?> replaceFailed) { // for updating loadTimestamp of already-failed entries
             this(replaceFailed.modelId, replaceFailed.modelInfo, replaceFailed.finalException());
         }
 
@@ -1628,20 +1601,6 @@ public abstract class ModelMesh extends ThriftService
 
         boolean inflightRequests() {
             return invokeCompletionCount != null && invokeCompletionCount.sum() < invokeCount.sum();
-        }
-
-        // ---------- second-copy trigger debounce -------------------
-
-        volatile long lastSecondCopyTriggerNanos;
-
-        // Note this is not required for correctness - only one ensureLoadedElsewhere
-        // call for a given model will "win", but it cuts down on unnecessary load
-        // when there are concurrent bursts of them
-        final boolean secondCopyTriggerDebounce(long nowMillis) {
-            long last = lastSecondCopyTriggerNanos;
-            // Rate limit to one per 10 seconds
-            return (last == 0L || nowMillis - last > 10_000L)
-                   && LAST_2ND_COPY_TIME_UPDATER.compareAndSet(this, last, nowMillis);
         }
 
         // -------------- invocation rate tracking -------------------
@@ -3244,7 +3203,6 @@ public abstract class ModelMesh extends ThriftService
     static final String TAS_INTERNAL_CXT_KEY = "tas.internal";
     static final String CACHE_HIT_EXCLUDES_KEY = "tas.ch_excludes";
     static final String CACHE_MISS_EXCLUDES_KEY = "tas.cm_excludes";
-    static final String LOAD_NEW_COPY_CXT_KEY = "tas.load_new_copy"; // used only with hit_only
     static final String BATCH_COUNT_CXT_KEY = "tas.batch_mult"; // used only with hit_only
     static final String CHAINED_LOAD_COUNT_KEY = "tas.chain_load_count";
     static final String KNOWN_SIZE_CXT_KEY = "tas.known_size";
@@ -3436,11 +3394,6 @@ public abstract class ModelMesh extends ThriftService
                 if (ce == null) {
                     throw new ModelNotHereException(instanceId, modelId);
                 }
-                // if caller determined that loading of a second copy of this model should be
-                // triggered as a result of this request, do it
-                if (lastUsedTime >= 0 && "true".equals(contextMap.get(LOAD_NEW_COPY_CXT_KEY))) {
-                    addSecondCopyAsync(modelId, lastUsedTime, currentTimeMillis(), ce);
-                }
                 try {
                     return invokeLocalModel(ce, method, args, modelId);
                 } catch (ModelLoadException mle) {
@@ -3562,7 +3515,6 @@ public abstract class ModelMesh extends ThriftService
                             }
                         }
 
-                        Boolean addSecondCopy = null;
                         if (!goLocal) {
                             // here we might be sending elsewhere in the cluster
                             // (or definitely so in balanced case, where we would have
@@ -3576,18 +3528,6 @@ public abstract class ModelMesh extends ThriftService
                                 // call "local only" version of prediction
                                 contextMap = ensureContextMapIsMutable(contextMap);
                                 contextMap.put(TAS_INTERNAL_CXT_KEY, HIT_ONLY);
-                                // determine whether the receiving instance should trigger
-                                // loading of another copy of the model. if so, indicate via context param
-                                if (lastUsedTime >= 0) {
-                                    long now = currentTimeMillis(), age = lastUsedTime == 0L ? 0L : now - lastUsedTime;
-                                    addSecondCopy = modelCopyShouldBeAdded(mr.getInstanceIds(),
-                                            age, now, false, mr.getType());
-                                }
-                                if (Boolean.TRUE.equals(addSecondCopy)) {
-                                    contextMap.put(LOAD_NEW_COPY_CXT_KEY, "true");
-                                } else {
-                                    contextMap.remove(LOAD_NEW_COPY_CXT_KEY);
-                                }
                                 if (logger.isDebugEnabled()) {
                                     logger.debug("model=" + modelId + " about to invoke other instances. tofilter="
                                                  + filtered);
@@ -3653,15 +3593,6 @@ public abstract class ModelMesh extends ThriftService
                                             // else fall-through
                                         }
                                     }
-                                }
-                                // trigger load of additional copy of model if applicable
-                                if (Boolean.TRUE.equals(addSecondCopy)) {
-                                    // we already determined second-copy trigger is necessary
-                                    addSecondCopyAsync(modelId, lastUsedTime, currentTimeMillis(), cacheEntry);
-                                } else if (addSecondCopy == null && lastUsedTime >= 0) {
-                                    // not yet determined either way
-                                    addSecondCopyIfNecessary(modelId, cacheEntry, mr.getInstanceIds(), lastUsedTime,
-                                            currentTimeMillis(), false);
                                 }
                                 filtered.add(instanceId, localLoaded);
                                 if (!favourSelfForHits) {
@@ -5541,13 +5472,19 @@ public abstract class ModelMesh extends ThriftService
             // applies only to time-tracking mode, updated after each non-empty iteration
             double averageModelParallelism = 1.0;
 
+            // this is incremented each iteration (~ every RATE_CHECK_INTERVAL_MS)
+            int counter;
+            // this keeps track of models which are only loaded in this instance (single copy)
+            // and have been used within the last 128 rate check intervals (128 * 10sec = 21 mins)
+            final Map<String, CacheEntry<?>> trackingSet = new HashMap<>();
+
             @Override
             public void run() {
                 Thread curThread = Thread.currentThread();
                 String threadNameBefore = setThreadName(curThread, "rate-track-task");
                 try {
-                    long lastTime = lastCheckTime, now = currentTimeMillis();
-                    long timeDelta = now - lastTime; // should be ~= RATE_CHECK_INTERVAL_MS
+                    final long lastTime = lastCheckTime, now = currentTimeMillis();
+                    final long timeDelta = now - lastTime; // should be ~= RATE_CHECK_INTERVAL_MS
 
                     // skip if too soon - i think this can happen if task executions
                     // get backed up in the taskPool
@@ -5555,133 +5492,198 @@ public abstract class ModelMesh extends ThriftService
                         return;
                     }
 
-                    int instCount = clusterStats.instanceCount;
-                    if (instCount <= 2) {
-                        return; // can't scale beyond 2 copies regardless
-                    }
+                    final int trackingSlice = (counter >> 5) & 3, sliceBit = 1 << trackingSlice;
+                    final int nextSliceBit = 1 << ((trackingSlice + 1) & 3);
+                    boolean success = false;
+                    try {
+                        int instCount = clusterStats.instanceCount;
+                        if (instCount < 2) {
+                            success = true;
+                            return; // can't scale if there are no other instances
+                        }
 
-                    final long before = logger.isDebugEnabled() ? nanoTime() : 0L;
+                        final long before = logger.isDebugEnabled() ? nanoTime() : 0L;
 
-                    Map<String, CacheEntry<?>> usedSinceLastRun = runtimeCache.descendingMapWithCutoff(lastTime);
-                    if (unloadManager != null) {
-                        unloadManager.removeUnloadBufferEntry(usedSinceLastRun);
-                    }
-                    if (usedSinceLastRun.isEmpty()) {
-                        // no invocations since last check
-                        lastCheckTime = now;
-                        return;
-                    }
+                        Map<String, CacheEntry<?>> usedSinceLastRun = runtimeCache.descendingMapWithCutoff(lastTime);
+                        if (unloadManager != null) {
+                            unloadManager.removeUnloadBufferEntry(usedSinceLastRun);
+                        }
+                        if (usedSinceLastRun.isEmpty()) {
+                            // no invocations since last check
+                            success = true;
+                            return;
+                        }
 
-                    // last-used timestamp to assign to newly trigger copy loads.
-                    // Set to 20sec in the *future* so that the logic in CacheMissForwardingLB
-                    // will have less placement tolerance w.r.t. how loaded the instances are
-                    final long newCopiesTimestamp = now + 20_000L;
+                        // last-used timestamp to assign to newly triggered copy loads.
+                        // Set to 20sec in the *future* so that the logic in CacheMissForwardingLB
+                        // will have less placement tolerance w.r.t. how loaded the instances are
+                        final long newCopiesTimestamp = now + 20_000L;
 
-                    boolean latencyBased = limitModelConcurrency;
-                    int scaleUpRpms = 0, heavyRpms = 0;
-                    if (!latencyBased) {
-                        scaleUpRpms = scaleUpRpmThreshold;
-                        heavyRpms = (scaleUpRpms * 3) / 4;
-                    }
-                    String modelId = null;
-                    Set<String> excludeSet = null; // instances to exclude because they are already highly loaded
-                    int modelParallelismSum = 0;
-                    for (Entry<String, CacheEntry<?>> ent : usedSinceLastRun.entrySet()) {
-                        try {
-                            modelId = ent.getKey(); // used in catch block
-                            CacheEntry<?> ce = ent.getValue();
-                            int suitableInstCount = instCount;
-                            if (typeConstraints != null) {
-                                // Check if this model type is constrained to a subset of instances
-                                // and skip if that subset comprises only one instance (us)
-                                ClusterStats cs = typeConstraints.getTypeSetStats(ce.modelInfo.serviceType);
-                                if (cs != null) {
-                                    suitableInstCount = cs.instanceCount;
+                        boolean latencyBased = limitModelConcurrency;
+                        int scaleUpRpms = 0, heavyRpms = 0;
+                        if (!latencyBased) {
+                            scaleUpRpms = scaleUpRpmThreshold;
+                            heavyRpms = (scaleUpRpms * 3) / 4;
+                        }
+                        String modelId = null;
+                        Set<String> excludeSet = null; // instances to exclude because they are already highly loaded
+                        int modelParallelismSum = 0;
+                        for (Entry<String, CacheEntry<?>> ent : usedSinceLastRun.entrySet()) {
+                            try {
+                                modelId = ent.getKey(); // used in catch block
+                                CacheEntry<?> ce = ent.getValue();
+                                ClusterStats clusterStats = typeSetStats(ce.modelInfo.serviceType);
+                                int suitableInstCount = instCount;
+                                if (typeConstraints != null) {
+                                    // Check if this model type is constrained to a subset of instances
+                                    // and skip if that subset comprises only one instance (us)
+                                    suitableInstCount = clusterStats.instanceCount;
                                     if (suitableInstCount < 2) {
                                         continue;
                                     }
                                 }
-                            }
-                            long count = ce.getAndResetIntervalCount();
-                            if (latencyBased) {
-                                MaxConcCacheEntry<?> mcce = (MaxConcCacheEntry<?>) ce;
-                                scaleUpRpms = mcce.getRpmScaleThreshold(true);
-                                heavyRpms = (scaleUpRpms * 3) / 4;
-                                modelParallelismSum += mcce.maxConc;
-                            }
-                            int rpm = (int) ((count * 60_000L) / timeDelta);
-                            //System.out.println("DEBUG: rateTrack "+modelId+" threshold="+scaleUpRpms+" current="+rpm);
-                            if (rpm > heavyRpms) ce.setLastHeavyTime(now);
-                            //TODO *maybe* tweak this more based on cluster state (other rpms)
-                            if (rpm < scaleUpRpms) continue; // load not high enough
-                            ModelRecord mr = registry.get(modelId);
-                            if (mr == null) continue; // not found in registry (not expected)
-                            // note, it's not possible for inst to be in both loaded + failed lists
-                            int loadedCount = mr.getInstanceIds().size();
-                            if (loadedCount < 2) continue; // for < 2 copies, load is triggered by other means
-                            int failedCount = mr.getLoadFailedInstanceIds().size();
+                                long count = ce.getAndResetIntervalCount();
+                                if (latencyBased) {
+                                    MaxConcCacheEntry<?> mcce = (MaxConcCacheEntry<?>) ce;
+                                    scaleUpRpms = mcce.getRpmScaleThreshold(true);
+                                    heavyRpms = (scaleUpRpms * 3) / 4;
+                                    modelParallelismSum += mcce.maxConc;
+                                }
+                                int rpm = (int) ((count * 60_000L) / timeDelta);
+                                //System.out.println("DEBUG: rateTrack "+modelId+" threshold="+scaleUpRpms+" current="+rpm);
+                                if (rpm > heavyRpms) ce.setLastHeavyTime(now);
 
-                            int candidateInstCount = suitableInstCount - (loadedCount + failedCount);
-                            if (candidateInstCount <= 0) continue; // no space to load new one
+                                ModelRecord mr = registry.get(modelId);
+                                if (mr == null) continue; // not found in registry (not expected)
+                                // note, it's not possible for inst to be in both loaded + failed lists
+                                int loadedCount = mr.getInstanceIds().size();
+                                if (loadedCount == 0) {
+                                    continue; // unexpected - likely mid transition
+                                }
+                                int failedCount = mr.getLoadFailedInstanceIds().size();
 
-                            // skip if a prior load was too recent to gauge new load requirement
-                            // - the measured req load won't fully take into account their serving contribution.
-                            // (unless it was our load, in which case it shouldn't be an overestimate)
-                            long recentLoadCutoff = now - (timeDelta + RATE_CHECK_INTERVAL_MS
-                                    + 2L * loadingTimeStats(mr.getType()).assumeCompletedAfterMillis());
-                            if (loadedSince(mr, recentLoadCutoff, instanceId)) continue;
+                                int candidateInstCount = suitableInstCount - (loadedCount + failedCount);
+                                if (candidateInstCount <= 0) continue; // no space to load new one
 
-                            Set<String> ourExcludeSet;
-                            if (excludeSet == null) {
-                                excludeSet = getExcludeSet(); // (construct lazily)
-                            }
-                            int excludedCount = excludeSet.size();
-                            if (excludedCount != 0) {
-                                for (String iid : excludeSet) {
-                                    if (!mr.getInstanceIds().containsKey(iid)
-                                        && !mr.loadFailedInInstance(iid)) {
-                                        candidateInstCount--;
+                                // For 1->2 copies, scale-up can also be triggered by a pattern of recent usage
+                                // See explanation of CacheEntry#usageSlices
+                                if (loadedCount == 1) {
+                                    // assert mr.getInstanceIds().containsKey(instanceId);
+                                    if ((ce.usageSlices & sliceBit) == 0) {
+                                        // If this is first detected usage in the timeslice, set the bit and
+                                        // ensure it's in the tracking set
+                                        ce.usageSlices |= sliceBit;
+                                        trackingSet.put(modelId, ce);
+                                    }
+                                    if ((ce.usageSlices & nextSliceBit) != 0) {
+                                        // Here we know the model was used in both the current and oldest slices
+                                        // (sliceBit and nextSliceBit are set respectively)
+
+                                        // Don't do it if > 90% full and cache is younger than 6 hours
+                                        if ((10 * clusterStats.totalFree) / clusterStats.totalCapacity >= 1
+                                                || (now - clusterStats.globalLru) > (6 * 3600_000)) {
+                                            logger.info("Attempting to add second copy of model " + modelId
+                                                    + " in another instance since \"regular\" usage was detected");
+                                            ensureLoadedInternalAsync(modelId, lastTime, ce.getWeight(), excludeThisInstance, 0);
+                                            continue;
+                                        }
                                     }
                                 }
-                                candidateInstCount -= excludedCount;
-                                if (candidateInstCount <= 0) {
-                                    continue; // no *suitable* candidates
+
+                                //TODO *maybe* tweak this more based on cluster state (other rpms)
+                                if (rpm < scaleUpRpms) continue; // load not high enough
+
+                                // skip if a prior load was too recent to gauge new load requirement
+                                // - the measured req load won't fully take into account their serving contribution.
+                                // (unless it was our load, in which case it shouldn't be an overestimate)
+                                long recentLoadCutoff = now - (timeDelta + RATE_CHECK_INTERVAL_MS
+                                        + 2L * loadingTimeStats(mr.getType()).assumeCompletedAfterMillis());
+                                if (loadedSince(mr, recentLoadCutoff, instanceId)) continue;
+
+                                Set<String> ourExcludeSet;
+                                if (excludeSet == null) {
+                                    excludeSet = getExcludeSet(); // (construct lazily)
                                 }
-                                ourExcludeSet = Sets.union(excludeSet, mr.getInstanceIds().keySet());
-                            } else {
-                                ourExcludeSet = mr.getInstanceIds().keySet();
-                            }
+                                int excludedCount = excludeSet.size();
+                                if (excludedCount != 0) {
+                                    for (String iid : excludeSet) {
+                                        if (!mr.getInstanceIds().containsKey(iid)
+                                                && !mr.loadFailedInInstance(iid)) {
+                                            candidateInstCount--;
+                                        }
+                                    }
+                                    candidateInstCount -= excludedCount;
+                                    if (candidateInstCount <= 0) {
+                                        continue; // no *suitable* candidates
+                                    }
+                                    ourExcludeSet = Sets.union(excludeSet, mr.getInstanceIds().keySet());
+                                } else {
+                                    ourExcludeSet = mr.getInstanceIds().keySet();
+                                }
 
-                            int copiesToLoad = Math.min(rpm / scaleUpRpms, candidateInstCount);
-                            // cap # copies to load in one go at max(2, 33% of cluster size)
-                            if (copiesToLoad > 2) {
-                                copiesToLoad = Math.min(copiesToLoad, suitableInstCount / 3);
-                            }
+                                int copiesToLoad = Math.min(rpm / scaleUpRpms, candidateInstCount);
+                                // cap # copies to load in one go at max(2, 33% of cluster size)
+                                if (copiesToLoad > 2) {
+                                    copiesToLoad = Math.min(copiesToLoad, suitableInstCount / 3);
+                                }
 
-                            List<String> toExclude = new ArrayList<>(ourExcludeSet);
-                            logger.info("Triggering scale-up of model " + modelId + " by " + copiesToLoad
+                                List<String> toExclude = new ArrayList<>(ourExcludeSet);
+                                logger.info("Triggering scale-up of model " + modelId + " by " + copiesToLoad
                                         + ", from " + loadedCount + " -> " + (loadedCount + copiesToLoad) + " copies"
                                         + (failedCount > 0 ? " (also has " + failedCount + " failure records)" : "")
                                         + ". RPM over last " + timeDelta + "ms was " + rpm
                                         + ", current threshold is " + scaleUpRpms
                                         + (excludedCount > 0 ? " (" + excludedCount + " instances excluded)" : ""));
-                            ensureLoadedInternalAsync(modelId, newCopiesTimestamp, ce.getWeight(), toExclude,
-                                    copiesToLoad - 1);
-                        } catch (RuntimeException e) {
-                            // shouldn't happen - but just in case continue loop
-                            logger.error("Unexpected runtime exception while processing request rate for model"
-                                         + (modelId != null ? " " + modelId : ""), e);
-                        } finally {
-                            modelId = null;
+                                ensureLoadedInternalAsync(modelId, newCopiesTimestamp, ce.getWeight(), toExclude,
+                                        copiesToLoad - 1);
+                            } catch (RuntimeException e) {
+                                // shouldn't happen - but just in case continue loop
+                                logger.error("Unexpected runtime exception while processing request rate for model"
+                                        + (modelId != null ? " " + modelId : ""), e);
+                            } finally {
+                                modelId = null;
+                            }
                         }
-                    }
-                    // only set this if we've reset the model counts
-                    lastCheckTime = now;
-                    if (latencyBased) averageModelParallelism = Math.max(1.0,
-                            ((double) modelParallelismSum) / usedSinceLastRun.size());
-                    if (before != 0L) {
-                        logger.debug("rateTrackingTask took " + msSince(before) + "ms, processed "
-                                     + usedSinceLastRun.size() + " models");
+                        success = true;
+                        if (latencyBased) {
+                            averageModelParallelism = Math.max(1.0,
+                                    ((double) modelParallelismSum) / usedSinceLastRun.size());
+                        }
+                        if (before != 0L) {
+                            logger.debug("rateTrackingTask took " + msSince(before) + "ms, processed "
+                                    + usedSinceLastRun.size() + " models");
+                        }
+
+                    } finally {
+                        if (success) {
+                            // only set this if we've reset the model counts
+                            lastCheckTime = now;
+                            counter++;
+                            if (!trackingSet.isEmpty() && (counter & 31) == 0) {
+                                // End of slice, prepare the next slice
+                                int sliceMask = ~nextSliceBit;
+                                // For each entry in the tracking set, zero out the next slice bit
+                                // Remove from the set if all slice bits are 0 or the entry is no longer
+                                // valid for tracking (removed from cache or we are no longer the only copy)
+                                for (Iterator<Entry<String, CacheEntry<?>>> it = trackingSet.entrySet().iterator();
+                                     it.hasNext();) {
+                                    final Entry<String, CacheEntry<?>> ent = it.next();
+                                    final CacheEntry<?> ce = ent.getValue();
+                                    final ModelRecord mr = ce.isFinished() ? null : registry.get(ent.getKey());
+                                    if (mr == null || mr.getInstanceIds().size() != 1) {
+                                        // no longer in cache or we are no longer the only copy
+                                        // reset slices and remove from tracking set
+                                        ce.usageSlices = 0;
+                                        it.remove();
+                                    } else {
+                                        ce.usageSlices &= sliceMask;
+                                        if (ce.usageSlices == 0) {
+                                            it.remove(); // remove from tracking set if all slices are zero
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 } finally {
                     curThread.setName(threadNameBefore);
@@ -5963,7 +5965,7 @@ public abstract class ModelMesh extends ThriftService
                                 modelId = (String) ent.getKey()[0];
                                 CacheEntry<?> ce = (CacheEntry<?>) ent.getKey()[2];
                                 int weight = ce.getWeight();
-                                boolean removed = addOrRemoveModelCopies(modelId, (ModelRecord) ent.getKey()[1], ce,
+                                boolean removed = removeModelCopies(modelId, (ModelRecord) ent.getKey()[1], ce,
                                         ent.getValue(), now,
                                         // allow removing our copy if none have been scaled down yet
                                         // or we're in the removal weight allowance
@@ -6027,26 +6029,18 @@ public abstract class ModelMesh extends ThriftService
     }
 
     /*
-     * The logic in this method is invoked by the local janitor task, and "scales up"
-     * or "scales down" the number of loaded copies of a model (across multiple instances)
+     * The logic in this method is invoked by the local janitor task, and "scales down"
+     * "scales down" the number of loaded copies of a model (across multiple instances)
      * based on how recently it was used.
      *
-     * The scale-up here is *only* for moving from 1 to 2 copies, to "catch" any
-     * missed by the other triggers on the invoke model request path. Growing beyond 2
-     * copies is handled by the rateTrackingTask.
+     * The corresponding scale-up is handled by the rateTrackingTask.
      *
      */
-    private boolean addOrRemoveModelCopies(String modelId, ModelRecord mr, CacheEntry<?> ce, long lastUsed,
-            long nowMillis, boolean canRemove) {
+    private boolean removeModelCopies(String modelId, ModelRecord mr, CacheEntry<?> ce, long lastUsed,
+                                      long nowMillis, boolean canRemove) {
         if (lastUsed == 0L) {
             return false; // gone, nothing to do
         }
-
-        /*
-         * If we have the only copy of this model, determine if it should be scaled up to 2 copies.
-         */
-        boolean copyAdded = addSecondCopyIfNecessary(modelId, ce, mr.getInstanceIds(), lastUsed, nowMillis,
-                ce.getApproxTotalInvocationCount() == 0);
 
         int numInstances = mr.getInstanceIds().size();
 
@@ -6068,7 +6062,7 @@ public abstract class ModelMesh extends ThriftService
          * (in any instance) into account ensures that multiple instances won't
          * make the same scale-down decision for the same model at the same time.
          */
-        if (!canRemove || copyAdded || numInstances < 2) {
+        if (!canRemove || numInstances < 2) {
             return false;
         }
 
@@ -6098,8 +6092,8 @@ public abstract class ModelMesh extends ThriftService
         if (numInstances == 2) {
             // if loaded in 2 places, reduce if old enough
             long lastHeavyTime = ce.getLastHeavyTime(), cacheAge = nowMillis - stats.globalLru;
-            long scaleDownAge = cacheAge / 5L; // 20% of cache "age"
-            if (lastHeavyTime == 0 || (nowMillis - lastHeavyTime) < cacheAge / 3L) {
+            long scaleDownAge = cacheAge / 10L; // 10% of cache "age"
+            if (lastHeavyTime == 0 || (nowMillis - lastHeavyTime) < cacheAge / 5L) {
                 // unless model has recent "heavy" usage, cap scale-down age at 16 hours
                 scaleDownAge = Math.min(SECOND_COPY_REMOVE_MAX_AGE_MS, scaleDownAge);
             }
@@ -6224,67 +6218,6 @@ public abstract class ModelMesh extends ThriftService
             }
         });
         return true;
-    }
-
-    // returns true if the add was attempted
-    protected boolean addSecondCopyIfNecessary(String modelId, CacheEntry<?> ce, Map<String, Long> loadedInstances,
-            long lastUsed, long nowMillis, boolean unused) {
-        if (lastUsed < 0) {
-            return false;
-        }
-        long age = lastUsed == 0L ? 0L : nowMillis - lastUsed;
-        if (!modelCopyShouldBeAdded(loadedInstances, age, nowMillis, unused, ce.modelType())) {
-            return false;
-        }
-        addSecondCopyAsync(modelId, lastUsed, nowMillis, ce);
-        return true;
-    }
-
-    /**
-     * @param loadedInstances
-     * @param age
-     * @param now
-     * @param unused          indicates whether this model has *really* been used yet since being
-     *                        loaded in this instance (models can be added/loaded with a recent lastUsed
-     *                        time for cache ordering purposes, without actually having yet been invoked)
-     * @return
-     */
-    protected boolean modelCopyShouldBeAdded(Map<String, Long> loadedInstances, long age, long now, boolean unused,
-            String modelType) {
-        int copiesLoaded = loadedInstances.size();
-        // don't do it if there's already more than one copy or last-used is before the threshold
-        if (copiesLoaded > 1) {
-            return false;
-        }
-        if (age >= SECOND_COPY_ADD_AGE_UNUSED_MS) {
-            // note the value below (12 hours) must be smaller than the 16-hour 2->1 scale-down
-            // cutoff in the janitor addOrRemoveModelCopies logic
-            if (unused || age > SECOND_COPY_ADD_AGE_USED_MS) {
-                return false;
-            }
-        }
-        // don't do it if the other copy only just started loading
-        if(copiesLoaded == 1 && (now - loadedInstances.values().iterator().next())
-                < Math.max(loadingTimeStats(modelType).mean() / 2, 2000L)) {
-            return false;
-        }
-
-        ClusterStats stats = typeSetStats(modelType);
-        // don't do it if there's nowhere to put a second copy
-        return stats.instanceCount > 1 &&
-               // don't do it if > 90% full and cache is younger than 3 hours
-               ((10 * stats.totalFree) / stats.totalCapacity >= 1
-                || (now - stats.globalLru) > (3 * 6 * SECOND_COPY_ADD_AGE_UNUSED_MS));
-    }
-
-    // ensure recently used models are loaded in two places
-    protected void addSecondCopyAsync(String modelId, long lastUsed, long nowMillis, CacheEntry<?> ce) {
-        if (ce.secondCopyTriggerDebounce(nowMillis)) {
-            long age = lastUsed == 0L ? 0L : nowMillis - lastUsed;
-            logger.info("Attempting to add second copy of model " + modelId + " in another instance since "
-                        + (age == 0 ? "it is in use" : "it was used " + age + "ms ago"));
-            ensureLoadedInternalAsync(modelId, lastUsed, ce.getWeight(), excludeThisInstance, 0);
-        }
     }
 
     protected void ensureLoadedInternalAsync(String modelId, long lastUsed, int weight, List<String> toExclude,
@@ -6569,7 +6502,7 @@ public abstract class ModelMesh extends ThriftService
                         // last-used time more recent than at least ~33% of the loaded models (since
                         // they will be replacing older loaded models)
                         long proactiveLastUsedCutoff = stats.globalLru == Long.MAX_VALUE ? 0L
-                                // minimum of 20 minutes here to avoid churn in pathological cases
+                                // minimum of 10 minutes here to avoid churn in pathological cases
                                 : stats.globalLru + Math.max(age(stats.globalLru) / 3L, 1_200_000L);
                         if (logger.isDebugEnabled()) {
                             logger.debug(excludeTypes == null ? "" :
